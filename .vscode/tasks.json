@@ -1,0 +1,22 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build VulkanLab with g++",
+      "type": "process",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "${workspaceFolder}/build/mingw-gcc"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": ["$gcc"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    }
+  ]
+}

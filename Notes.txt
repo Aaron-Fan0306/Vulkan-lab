@@ -1,0 +1,15 @@
+A shader gives the mathematical calculation to where to draw the pixel/texel to screen.(calculates position)
+A rendering command gives instruction to draw it
+A vkImage is NOT a rendered image, its a blank canva/paint palet for shaders to calculate the pixels and draw on it
+
+Rendering commands = restaurant order
+Shaders            = recipe
+GPU                = cooks
+VkImage            = plate
+
+A physical device is the supported feature the user's hardware can support, varies depending on the gpu(AMD, NVIDIA, Intel, etc)
+A logical device is the usable connection to a selected physical device. Request extensions, queues and features.
+
+A VkSurfacKHR connects vulkan presentation to an OS window, where the image will be draw to.
+
+A swapchain, a queue of vkimage wait to be drawn, creates the format and size and type of vk image you want on creation

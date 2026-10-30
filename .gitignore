@@ -1,0 +1,6 @@
+out/
+build/
+.vs/
+CMakeSettings.json
+/CMakeUserPresets.json
+/build-log.txt
