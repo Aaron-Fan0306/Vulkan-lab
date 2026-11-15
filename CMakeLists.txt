@@ -43,7 +43,9 @@ add_executable(VulkanLab
     src/main.cpp
     src/application.cpp
     includes/application.hpp
+    includes/resources.hpp
     src/utilities/utilities.cpp
+    externals/tiny_gltf.cpp
 )
 
 target_compile_features(VulkanLab
@@ -58,6 +60,7 @@ set_target_properties(VulkanLab PROPERTIES
 target_include_directories(VulkanLab
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/includes"
+        "${CMAKE_CURRENT_SOURCE_DIR}/externals"
 )
 
 target_compile_definitions(VulkanLab

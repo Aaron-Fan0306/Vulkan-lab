@@ -1,11 +1,16 @@
-#include <iostream>
-#include <SDL3/SDL.h>
-#include <volk.h>
 #include "application.hpp"
+#include <iostream>
+#include <print>
+#include <unordered_map>
+#include <SDL3/SDL.h>
 #include "utilities/utilities.hpp"
-#define VOLK_IMPLEMENTATION
+#include <volk.h>
 #define VMA_IMPLEMENTATION
+
 #include <vma/vk_mem_alloc.h>
+#include <glm/gtc/type_ptr.hpp>
+#include <glm/glm.hpp>
+
 
 bool Application::initialize()
 {
@@ -88,6 +93,34 @@ bool Application::initializeVulkan()
 		return false;
 	}
 	return true;
+}
+
+bool Application::loadData()
+{
+    //preallocate memories for vertex and index data
+    constexpr size_t vertex_buffer_bytes = 64 * 1024 *  1024;//64 mega bytes bc one kilo byte is 1024 byte
+    constexpr size_t index_buffer_bytes = 32 * 1024 * 1024;//32 mega bytes, remember to not use ^ because c++ does not reconize it as exponent
+    constexpr size_t total_vertices = vertex_buffer_bytes / sizeof(Vertex);
+    constexpr size_t total_indices = index_buffer_bytes / sizeof(uint32_t);
+    m_vertices.resize(total_vertices);
+    m_indices.resize(total_indices);
+
+    //fallback 1x1 white texture base color texture (0-index in texture array)
+    uint32_t white_pixel_data = 0xFFFFfFFF;
+    Image white_pixel
+    {
+        .width = 1,
+        .height = 1,
+        .channels = 4,
+        .data = reinterpret_cast<unsigned char *>(&white_pixel_data)
+    };
+
+    VkCommandBuffer white_image_command_buffer = startTransientCommandBuffer();
+    auto [white_image_id, white_staging_buffer] = createImage(white_image_command_buffer, white_pixel.data, white_pixel.width, white_pixel.height, 4);
+    m_white_pixel_image_id = white_image_id;
+    submitTransientCommandBuffer(white_image_command_buffer);
+    vmaDestroyBuffer(vma_allocator, white_staging_buffer.vk_buffer, white_staging_buffer.allocation);
+    return true;
 }
 
 bool Application::createVulkanInstance()
@@ -551,7 +584,20 @@ bool Application::createCommandBuffers()
             showError("failed to create command pool");
             return false;
         }
-
+        for (FrameResources &res : frame_resources)
+        {
+            VkCommandPoolCreateInfo pool_info
+            {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                .queueFamilyIndex = graphics_queue_family_index
+            };
+            if (vkCreateCommandPool(device, &pool_info, nullptr, &command_pool) != VK_SUCCESS)
+            {
+                showError("could not create command buffer");
+                return false;
+            }
+        }
+        //create command buffer for this frame
         VkCommandBufferAllocateInfo command_allocate_info
         {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -580,7 +626,7 @@ bool Application::syncResources()
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         .pNext = &timeline_semaphore_create_info
     };
-    if (vkCreateSemaphore(device, &semaphore_create_info, nullptr, &timeline_semaphore))
+    if(vkCreateSemaphore(device, &semaphore_create_info, nullptr, &timeline_semaphore))
     {
         showError("could not create the timeline semaphore(at function 'syncResources()')");
         return false;
@@ -588,7 +634,7 @@ bool Application::syncResources()
     for(FrameResources &resources : frame_resources)
     {
         VkSemaphoreCreateInfo semaphore_create_info { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-        if (vkCreateSemaphore(device, &semaphore_create_info, nullptr, &resources.image_acquired_semaphore))
+        if(vkCreateSemaphore(device, &semaphore_create_info, nullptr, &resources.image_acquired_semaphore))
         {
             showError("failed to create image accquired semaphore");
             return false;
@@ -600,7 +646,7 @@ bool Application::syncResources()
 bool Application::destroySwapchain()
 {
    //no reference or ptr bc the view type is already a pointer
-    for (VkImageView targeted_image_view : swapchain_image_views)
+    for(VkImageView targeted_image_view : swapchain_image_views)
     {
         vkDestroyImageView(device, targeted_image_view, nullptr);
     }
@@ -612,7 +658,7 @@ bool Application::destroySwapchain()
     {
         vkDestroySemaphore(device, targeted_semaphore, nullptr);
     }
-    if (swapchain)// on success it returns non zero so if becomes true
+    if(swapchain)// on success it returns non zero so if becomes true
     {
         vkDestroySwapchainKHR(device, swapchain, nullptr);
         //swapchain has to go ka-boom with the image view :)
@@ -631,7 +677,7 @@ bool Application::createShaders()
 {
     if(vertex_shader = createShaderModule("shader.vertex", shaderc_vertex_shader); !vertex_shader)
         return false;
-    if (fragment_shader = createShaderModule("shader.fragment", shaderc_fragment_shader) ; !fragment_shader)
+    if(fragment_shader = createShaderModule("shader.fragment", shaderc_fragment_shader) ; !fragment_shader)
         return false;
     return true;
 }
@@ -675,6 +721,172 @@ VkShaderModule Application::createShaderModule(const std::string &file_name, sha
         return nullptr;
     }
     return shader_module;
+}
+
+std::pair<uint32_t, GPUBuffer> Application::createImage(VkCommandBuffer command_buffer, unsigned char *image_data, uint32_t width, uint32_t height, int channels)
+{
+    VkFormat image_format = VK_FORMAT_R8G8B8_SRGB;
+    VkImageCreateInfo image_info
+    {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = image_format,
+        .extent = {.width = width, .height = height, .depth = 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+    VmaAllocationCreateInfo allocation_info { .usage = VMA_MEMORY_USAGE_AUTO};
+    GPUImage gpu_image;
+    if (vmaCreateImage(vma_allocator, &image_info, &allocation_info, &gpu_image.image, &gpu_image.allocation, nullptr) != VK_SUCCESS)
+    {
+        showError("failed to generate vkImage");
+        return {0, GPUBuffer {}};
+    }
+    VkImageViewCreateInfo image_view_info
+    {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = gpu_image.image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = image_format,
+        .subresourceRange
+        {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1,
+            .layerCount = 1
+        }
+    };
+    if ( vkCreateImageView(device, &image_view_info, nullptr, &gpu_image.image_view))
+    {
+        showError("cannot generate image view");
+        return { 0, GPUBuffer {}};
+    }
+
+    //transition the image to tansfer-DST(destination)
+    VkImageMemoryBarrier2 transfer_barrier
+    {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+        .srcAccessMask = VK_ACCESS_2_NONE,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .image = gpu_image.image,
+        .subresourceRange
+        {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+    VkDependencyInfo transfer_dependency_info
+    {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &transfer_barrier
+    };
+    vkCmdPipelineBarrier2(command_buffer, &transfer_dependency_info);
+
+    //create staging buffer and issue record copy operation
+    const size_t byte_size = width * height * channels;//how many possible pixel color and position
+    GPUBuffer stage_buffer = createBuffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, byte_size, true, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    mapCopyBufferData(stage_buffer, 0, image_data, byte_size);
+
+	VkBufferImageCopy buffer_image_copy
+	{
+		.imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
+		.imageExtent = {.width = width, .height = height, .depth = 1 },
+	};
+
+    VkImageMemoryBarrier2 shader_read_barrier
+    {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
+   		.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		.image = gpu_image.image,
+		.subresourceRange
+		{
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		}
+    };
+    VkDependencyInfo shader_read_dependency_info
+    {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &shader_read_barrier
+    };
+    m_images.emplace_back(gpu_image);
+    const uint32_t image_id = m_images.size();
+    return { image_id, stage_buffer };
+}
+
+uint32_t Application::addBuffer(const GPUBuffer &buffer)
+{
+    m_buffers.emplace_back(buffer);
+    uint32_t buffer_id = m_buffers.size();
+    return 0;
+}
+
+GPUBuffer Application::createBuffer(VkBufferUsageFlags buffer_usage, size_t byte_size, bool mappable, VmaMemoryUsage memory_usage)
+{
+    VkBufferCreateInfo buffer_info
+    {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = byte_size,
+        .usage = buffer_usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    VmaAllocationCreateInfo allocation_info
+    {
+        .flags = mappable ? VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT : 0u,
+        .usage = memory_usage
+    };
+    GPUBuffer gpu_buffer;
+    if (vmaCreateBuffer(vma_allocator, &buffer_info, &allocation_info, &gpu_buffer.vk_buffer, &gpu_buffer.allocation, nullptr) != VK_SUCCESS)
+    {
+        return GPUBuffer{};
+    }
+
+    if (buffer_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+    {
+        VkBufferDeviceAddressInfo buffer_device_address_info
+        {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .buffer = gpu_buffer.vk_buffer
+        };
+        gpu_buffer.device_address = vkGetBufferDeviceAddress(device, &buffer_device_address_info);
+    }
+    return gpu_buffer;
+}
+
+void Application::mapCopyBufferData(const GPUBuffer &buffer, size_t buffer_offset, void *data, size_t byte_size)//provide a destination buffer/ buffer to copy to, the offset(if you want), and a source buffer to copy from and the amount in byte needed to copy
+{
+    void *buffer_ptr = nullptr;
+    if (vmaMapMemory(vma_allocator, buffer.allocation, &buffer_ptr) != VK_SUCCESS)
+    //retrieve the address of the provided buffer
+    {
+        showError("Unable to map bufer memory");
+        return;
+    }
+    std::memcpy(static_cast<char *>(buffer_ptr) + buffer_offset, data, byte_size);
+    //combines the buffer address with the offset(if exist at all) = destination
+    //source is the data contained within the buffer provided to copy from(void *data)
+    vmaUnmapMemory(vma_allocator, buffer.allocation);
+    //release the memory
 }
 
 void Application::render()
@@ -1020,6 +1232,50 @@ bool Application::initializeVMA()
         return false;
     }
     return true;
+}
+
+VkCommandBuffer Application::startTransientCommandBuffer()
+{
+    VkCommandBufferAllocateInfo command_buffer_info
+    {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+    VkCommandBuffer command_buffer = nullptr;
+    if (vkAllocateCommandBuffers(device, &command_buffer_info, &command_buffer) != VK_SUCCESS)
+    {
+        showError("failed to allocate command buffer");
+        return nullptr;
+    }
+    VkCommandBufferBeginInfo begin_info
+    {
+        .sType = VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    if (vkBeginCommandBuffer(command_buffer, &begin_info) != VK_SUCCESS)
+    {
+        showError("Unable to begin command buffer");
+        return nullptr;
+    }
+    return command_buffer;
+}
+
+void Application::submitTransientCommandBuffer(VkCommandBuffer command_buffer)
+{
+    vkEndCommandBuffer(command_buffer);
+
+    VkSubmitInfo submit_info
+    {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &command_buffer
+    };
+
+    vkQueueSubmit(graphics_queue, 1, &submit_info, nullptr);
+    vkQueueWaitIdle(graphics_queue);
+    vkFreeCommandBuffers(device, command_pool, 1, &command_buffer);
 }
 
 void Application::showError(const std::string &error_message) const
