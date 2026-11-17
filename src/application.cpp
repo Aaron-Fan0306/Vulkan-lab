@@ -2,6 +2,8 @@
 #include <iostream>
 #include <print>
 #include <unordered_map>
+#include <vector>
+#include <array>
 #include <SDL3/SDL.h>
 #include "utilities/utilities.hpp"
 #include <volk.h>
@@ -572,31 +574,31 @@ bool Application::createSwapchain(uint32_t width, uint32_t height)
 bool Application::createCommandBuffers()
 {   
     //modifies the frame_resource list directly by using the reference(&) symbol
-    for (FrameResources &resources : frame_resources)
-    {
-        VkCommandPoolCreateInfo command_pool_create_info
+        VkCommandPoolCreateInfo pool_create_info
         {
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
             .queueFamilyIndex = graphics_queue_family_index
         };
-        if(vkCreateCommandPool(device, &command_pool_create_info, nullptr, &resources.command_pool))
+        if(vkCreateCommandPool(device, &pool_create_info, nullptr, &command_pool))
         {
             showError("failed to create command pool");
             return false;
         }
-        for (FrameResources &res : frame_resources)
+    
+   for (FrameResources &resources : frame_resources)
+    {
+        VkCommandPoolCreateInfo pool_info
         {
-            VkCommandPoolCreateInfo pool_info
-            {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                .queueFamilyIndex = graphics_queue_family_index
-            };
-            if (vkCreateCommandPool(device, &pool_info, nullptr, &command_pool) != VK_SUCCESS)
-            {
-                showError("could not create command buffer");
-                return false;
-            }
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .queueFamilyIndex = graphics_queue_family_index
+        };
+        if (vkCreateCommandPool(device, &pool_info, nullptr, &command_pool) != VK_SUCCESS)
+        {
+            showError("could not create command buffer");
+            return false;
         }
+        
         //create command buffer for this frame
         VkCommandBufferAllocateInfo command_allocate_info
         {
@@ -725,7 +727,7 @@ VkShaderModule Application::createShaderModule(const std::string &file_name, sha
 
 std::pair<uint32_t, GPUBuffer> Application::createImage(VkCommandBuffer command_buffer, unsigned char *image_data, uint32_t width, uint32_t height, int channels)
 {
-    VkFormat image_format = VK_FORMAT_R8G8B8_SRGB;
+    VkFormat image_format = VK_FORMAT_R8G8B8A8_SRGB;
     VkImageCreateInfo image_info
     {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -768,7 +770,7 @@ std::pair<uint32_t, GPUBuffer> Application::createImage(VkCommandBuffer command_
     //transition the image to tansfer-DST(destination)
     VkImageMemoryBarrier2 transfer_barrier
     {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
         .srcAccessMask = VK_ACCESS_2_NONE,
         .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -803,6 +805,7 @@ std::pair<uint32_t, GPUBuffer> Application::createImage(VkCommandBuffer command_
 		.imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
 		.imageExtent = {.width = width, .height = height, .depth = 1 },
 	};
+    vkCmdCopyBufferToImage( command_buffer, stage_buffer.vk_buffer, gpu_image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &buffer_image_copy);
 
     VkImageMemoryBarrier2 shader_read_barrier
     {
@@ -829,16 +832,51 @@ std::pair<uint32_t, GPUBuffer> Application::createImage(VkCommandBuffer command_
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &shader_read_barrier
     };
+    vkCmdPipelineBarrier2(command_buffer, &shader_read_dependency_info);
     m_images.emplace_back(gpu_image);
     const uint32_t image_id = m_images.size();
     return { image_id, stage_buffer };
+}
+
+std::vector<uint32_t> Application::upLoadImage(const std::vector<Image> &images)
+{
+    VkCommandBuffer command_buffer = startTransientCommandBuffer();
+    std::vector<GPUBuffer> staging_buffers;
+    staging_buffers.reserve(images.size());
+
+    //upload image to GPU texture
+    std::vector<uint32_t> image_ids(images.size());
+    for (size_t i = 0; i < i < images.size(); ++i)
+    {
+        const Image &image = images[i];//alias. second name for images[i]/current image in the loop
+        if (image.data)
+        {
+            auto[image_id, staging_texture_buffer] = createImage(command_buffer, image.data, image.width, image.height, image.channels);
+            //structure binding requires auto keyword and you cannot explicitly define the types yourself :(
+            image_ids[i] = image_id;
+            staging_buffers.emplace_back(staging_texture_buffer);
+        }
+        else
+        {
+            image_ids[i] = m_white_pixel_image_id;
+        }
+    }
+
+    submitTransientCommandBuffer(command_buffer);
+
+    //clean staging buffer
+    for (GPUBuffer &stage_buffer : staging_buffers)
+    {
+        vmaDestroyBuffer(vma_allocator, stage_buffer.vk_buffer, stage_buffer.allocation);
+    }
+    return image_ids;
 }
 
 uint32_t Application::addBuffer(const GPUBuffer &buffer)
 {
     m_buffers.emplace_back(buffer);
     uint32_t buffer_id = m_buffers.size();
-    return 0;
+    return buffer_id;
 }
 
 GPUBuffer Application::createBuffer(VkBufferUsageFlags buffer_usage, size_t byte_size, bool mappable, VmaMemoryUsage memory_usage)
@@ -887,6 +925,105 @@ void Application::mapCopyBufferData(const GPUBuffer &buffer, size_t buffer_offse
     //source is the data contained within the buffer provided to copy from(void *data)
     vmaUnmapMemory(vma_allocator, buffer.allocation);
     //release the memory
+}
+
+bool Application::createDescriptorSets()
+{
+    std::array<VkDescriptorPoolSize, 1> pool_sizes
+    {
+        VkDescriptorPoolSize{
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = max_textures
+        }
+    };
+    VkDescriptorPoolCreateInfo pool_info
+    {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
+        .maxSets = 1,
+        .poolSizeCount = pool_sizes.size(),
+        .pPoolSizes = pool_sizes.data()
+    };
+    if (vkCreateDescriptorPool(device, &pool_info, nullptr, &m_descriptor_pool) != VK_SUCCESS)
+    {
+        showError("cannot create descriptor set");
+        return false;
+    }
+    //global descriptor sets
+    std::array<VkDescriptorSetLayoutBinding, 1> bindings
+    {
+        VkDescriptorSetLayoutBinding
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = max_textures,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT
+        }
+    };
+    std::array<VkDescriptorBindingFlags, 1> flags;
+    flags[0] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flag_info
+    {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+        .bindingCount = flags.size(),
+        .pBindingFlags = flags.data()
+    };
+
+    VkDescriptorSetLayoutCreateInfo layout_info
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pNext = &flag_info,
+        .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
+        .bindingCount = bindings.size(),
+        .pBindings = bindings.data()
+    };
+    if (vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &m_global_descriptor_set_layout) != VK_SUCCESS)
+    {
+        showError("failed to create descriptor set layout");
+        return false;
+    }
+    //create the actual descriptor set
+    VkDescriptorSetAllocateInfo descriptor_allocate_info
+    {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = m_descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &m_global_descriptor_set_layout
+    };
+    if (vkAllocateDescriptorSets(device, &descriptor_allocate_info, &m_global_descriptor_set) != VK_SUCCESS)
+    {
+        showError("cannot allocate descriptor set");
+        return false;
+    }
+    return true;
+}
+
+void Application::updateTextureDescriptors()
+{
+    // create combine imaged image&sampler
+    std::vector<VkDescriptorImageInfo> image_descriptors;
+    image_descriptors.reserve(m_textures.size());
+    for (const Texture &texture : m_textures)
+    {
+        image_descriptors.push_back
+        ({
+            .sampler = m_samplers[texture.sampler_id - 1],
+            .imageView = m_images[texture.image_id].image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+         });
+    }
+    VkWriteDescriptorSet descriptor_set_write
+    {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = m_global_descriptor_set,
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorCount = static_cast<uint32_t>(image_descriptors.size()),
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = image_descriptors.data()
+    };
+    vkUpdateDescriptorSets(device, 1, &descriptor_set_write, 0, nullptr);
 }
 
 void Application::render()
@@ -1251,7 +1388,7 @@ VkCommandBuffer Application::startTransientCommandBuffer()
     }
     VkCommandBufferBeginInfo begin_info
     {
-        .sType = VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO,
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
     };
     if (vkBeginCommandBuffer(command_buffer, &begin_info) != VK_SUCCESS)
